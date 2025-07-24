@@ -415,3 +415,324 @@
         (ok true)
     )
 )
+
+;; ==================== MARKETPLACE FUNCTIONS ====================
+
+;; List NFT for sale
+(define-public (list-nft (token-id uint) (price uint))
+    (let (
+        (owner (unwrap! (map-get? nft-owners token-id) ERR-NOT-FOUND))
+    )
+        ;; Validate listing
+        (asserts! (is-marketplace-enabled) ERR-UNAUTHORIZED)
+        (asserts! (is-eq tx-sender owner) ERR-NOT-OWNER)
+        (asserts! (> price u0) ERR-INVALID-PRICE)
+        (asserts! (is-none (map-get? listings token-id)) ERR-ALREADY-EXISTS)
+        
+        ;; Create listing
+        (map-set listings token-id {
+            seller: owner,
+            price: price,
+            listed-at: (get-current-block)
+        })
+        
+        (print {
+            action: "listed",
+            token-id: token-id,
+            seller: owner,
+            price: price
+        })
+        
+        (ok true)
+    )
+)
+
+;; Update listing price
+(define-public (update-listing-price (token-id uint) (new-price uint))
+    (let (
+        (listing (unwrap! (map-get? listings token-id) ERR-NOT-FOR-SALE))
+        (seller (get seller listing))
+    )
+        ;; Validate update
+        (asserts! (is-eq tx-sender seller) ERR-NOT-OWNER)
+        (asserts! (> new-price u0) ERR-INVALID-PRICE)
+        
+        ;; Update listing
+        (map-set listings token-id
+            (merge listing {price: new-price})
+        )
+        
+        (print {
+            action: "price-updated",
+            token-id: token-id,
+            seller: seller,
+            old-price: (get price listing),
+            new-price: new-price
+        })
+        
+        (ok true)
+    )
+)
+
+;; Remove listing
+(define-public (unlist-nft (token-id uint))
+    (let (
+        (listing (unwrap! (map-get? listings token-id) ERR-NOT-FOR-SALE))
+        (seller (get seller listing))
+    )
+        ;; Validate unlisting
+        (asserts! (is-eq tx-sender seller) ERR-NOT-OWNER)
+        
+        ;; Remove listing
+        (map-delete listings token-id)
+        
+        (print {
+            action: "unlisted",
+            token-id: token-id,
+            seller: seller
+        })
+        
+        (ok true)
+    )
+)
+
+;; Buy NFT
+(define-public (buy-nft (token-id uint))
+    (let (
+        (listing (unwrap! (map-get? listings token-id) ERR-NOT-FOR-SALE))
+        (seller (get seller listing))
+        (price (get price listing))
+        (metadata (unwrap! (map-get? nft-metadata token-id) ERR-NOT-FOUND))
+        (creator (get creator metadata))
+        (royalty-rate (get royalty metadata))
+        (marketplace-fee (calculate-marketplace-fee price))
+        (royalty-amount (calculate-royalty price royalty-rate))
+        (seller-amount (- (- price marketplace-fee) royalty-amount))
+    )
+        ;; Validate purchase
+        (asserts! (is-marketplace-enabled) ERR-UNAUTHORIZED)
+        (asserts! (not (is-eq tx-sender seller)) ERR-SELF-PURCHASE)
+        (asserts! (>= (stx-get-balance tx-sender) price) ERR-INSUFFICIENT-FUNDS)
+        
+        ;; Transfer STX payments
+        (try! (stx-transfer? seller-amount tx-sender seller))
+        (try! (stx-transfer? marketplace-fee tx-sender CONTRACT-OWNER))
+        
+        ;; Pay royalties to creator (if different from seller)
+        (if (and (> royalty-amount u0) (not (is-eq creator seller)))
+            (try! (stx-transfer? royalty-amount tx-sender creator))
+            true
+        )
+        
+        ;; Transfer NFT ownership
+        (map-set nft-owners token-id tx-sender)
+        
+        ;; Remove listing
+        (map-delete listings token-id)
+        
+        ;; Update statistics
+        (var-set total-marketplace-revenue 
+            (+ (var-get total-marketplace-revenue) marketplace-fee)
+        )
+        (var-set total-creator-royalties 
+            (+ (var-get total-creator-royalties) royalty-amount)
+        )
+        
+        ;; Update seller stats
+        (map-set collection-stats seller
+            (merge 
+                (default-to {total-minted: u0, total-sold: u0, total-volume: u0}
+                    (map-get? collection-stats seller)
+                )
+                {
+                    total-sold: (+ (default-to u0 
+                        (get total-sold (map-get? collection-stats seller))) u1),
+                    total-volume: (+ (default-to u0 
+                        (get total-volume (map-get? collection-stats seller))) price)
+                }
+            )
+        )
+        
+        (print {
+            action: "purchased",
+            token-id: token-id,
+            buyer: tx-sender,
+            seller: seller,
+            price: price,
+            marketplace-fee: marketplace-fee,
+            royalty-amount: royalty-amount
+        })
+        
+        (ok true)
+    )
+)
+
+;; Get listing information
+(define-read-only (get-listing (token-id uint))
+    (map-get? listings token-id)
+)
+
+;; Check if NFT is listed
+(define-read-only (is-listed (token-id uint))
+    (is-some (map-get? listings token-id))
+)
+
+;; ==================== OFFER FUNCTIONS ====================
+
+;; Make offer on NFT
+(define-public (make-offer (token-id uint) (amount uint) (expires-at uint))
+    (begin
+        ;; Validate offer
+        (asserts! (nft-exists token-id) ERR-NOT-FOUND)
+        (asserts! (> amount u0) ERR-INVALID-PRICE)
+        (asserts! (> expires-at (get-current-block)) ERR-INVALID-PARAMETERS)
+        (asserts! (>= (stx-get-balance tx-sender) amount) ERR-INSUFFICIENT-FUNDS)
+        
+        ;; Store offer
+        (map-set offers {nft-id: token-id, buyer: tx-sender} {
+            amount: amount,
+            expires-at: expires-at
+        })
+        
+        (print {
+            action: "offer-made",
+            token-id: token-id,
+            buyer: tx-sender,
+            amount: amount,
+            expires-at: expires-at
+        })
+        
+        (ok true)
+    )
+)
+
+;; Accept offer
+(define-public (accept-offer (token-id uint) (buyer principal))
+    (let (
+        (owner (unwrap! (map-get? nft-owners token-id) ERR-NOT-FOUND))
+        (offer (unwrap! (map-get? offers {nft-id: token-id, buyer: buyer}) ERR-NOT-FOUND))
+        (amount (get amount offer))
+        (expires-at (get expires-at offer))
+        (metadata (unwrap! (map-get? nft-metadata token-id) ERR-NOT-FOUND))
+        (creator (get creator metadata))
+        (royalty-rate (get royalty metadata))
+        (marketplace-fee (calculate-marketplace-fee amount))
+        (royalty-amount (calculate-royalty amount royalty-rate))
+        (seller-amount (- (- amount marketplace-fee) royalty-amount))
+    )
+        ;; Validate acceptance
+        (asserts! (is-eq tx-sender owner) ERR-NOT-OWNER)
+        (asserts! (<= (get-current-block) expires-at) ERR-AUCTION-ENDED)
+        (asserts! (>= (stx-get-balance buyer) amount) ERR-INSUFFICIENT-FUNDS)
+        
+        ;; Execute transfer payments
+        (try! (stx-transfer? seller-amount buyer tx-sender))
+        (try! (stx-transfer? marketplace-fee buyer CONTRACT-OWNER))
+        
+        ;; Pay royalties to creator (if different from seller)
+        (if (and (> royalty-amount u0) (not (is-eq creator tx-sender)))
+            (try! (stx-transfer? royalty-amount buyer creator))
+            true
+        )
+        
+        ;; Transfer NFT ownership
+        (map-set nft-owners token-id buyer)
+        
+        ;; Remove listing if exists
+        (map-delete listings token-id)
+        
+        ;; Remove offer
+        (map-delete offers {nft-id: token-id, buyer: buyer})
+        
+        ;; Update statistics
+        (var-set total-marketplace-revenue 
+            (+ (var-get total-marketplace-revenue) marketplace-fee)
+        )
+        (var-set total-creator-royalties 
+            (+ (var-get total-creator-royalties) royalty-amount)
+        )
+        
+        (print {
+            action: "offer-accepted",
+            token-id: token-id,
+            buyer: buyer,
+            seller: tx-sender,
+            amount: amount
+        })
+        
+        (ok true)
+    )
+)
+
+;; Cancel offer
+(define-public (cancel-offer (token-id uint))
+    (let (
+        (offer (unwrap! (map-get? offers {nft-id: token-id, buyer: tx-sender}) ERR-NOT-FOUND))
+    )
+        ;; Remove offer
+        (map-delete offers {nft-id: token-id, buyer: tx-sender})
+        
+        (print {
+            action: "offer-cancelled",
+            token-id: token-id,
+            buyer: tx-sender
+        })
+        
+        (ok true)
+    )
+)
+
+;; Get offer information
+(define-read-only (get-offer (token-id uint) (buyer principal))
+    (map-get? offers {nft-id: token-id, buyer: buyer})
+)
+
+;; ==================== ADMIN FUNCTIONS ====================
+
+;; Toggle marketplace status (admin only)
+(define-public (toggle-marketplace)
+    (begin
+        (asserts! (is-contract-owner) ERR-UNAUTHORIZED)
+        (var-set marketplace-enabled (not (var-get marketplace-enabled)))
+        
+        (print {
+            action: "marketplace-toggled",
+            enabled: (var-get marketplace-enabled)
+        })
+        
+        (ok (var-get marketplace-enabled))
+    )
+)
+
+;; Update contract URI (admin only)
+(define-public (set-contract-uri (new-uri (string-ascii 256)))
+    (begin
+        (asserts! (is-contract-owner) ERR-UNAUTHORIZED)
+        (var-set contract-uri new-uri)
+        
+        (print {
+            action: "contract-uri-updated",
+            new-uri: new-uri
+        })
+        
+        (ok true)
+    )
+)
+
+;; Emergency withdrawal (admin only)
+(define-public (emergency-withdraw (amount uint))
+    (begin
+        (asserts! (is-contract-owner) ERR-UNAUTHORIZED)
+        (asserts! (> amount u0) ERR-INVALID-PARAMETERS)
+        (asserts! (>= (stx-get-balance (as-contract tx-sender)) amount) ERR-INSUFFICIENT-FUNDS)
+        
+        (try! (as-contract (stx-transfer? amount tx-sender CONTRACT-OWNER)))
+        
+        (print {
+            action: "emergency-withdrawal",
+            amount: amount
+        })
+        
+        (ok true)
+    )
+)
