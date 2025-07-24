@@ -158,3 +158,260 @@
         total-supply: (- (var-get next-token-id) u1)
     }
 )
+
+;; ==================== CORE NFT FUNCTIONS ====================
+
+;; Get owner of NFT
+(define-read-only (get-owner (token-id uint))
+    (map-get? nft-owners token-id)
+)
+
+;; Get NFT metadata
+(define-read-only (get-metadata (token-id uint))
+    (map-get? nft-metadata token-id)
+)
+
+;; Get NFT URI (for compatibility)
+(define-read-only (get-token-uri (token-id uint))
+    (match (map-get? nft-metadata token-id)
+        metadata (ok (some (get image-uri metadata)))
+        (ok none)
+    )
+)
+
+;; Check if NFT exists
+(define-read-only (nft-exists (token-id uint))
+    (is-some (map-get? nft-owners token-id))
+)
+
+;; Get all NFTs owned by a principal
+(define-read-only (get-balance (owner principal))
+    (default-to u0 
+        (get total-minted (map-get? collection-stats owner))
+    )
+)
+
+;; Get user profile
+(define-read-only (get-user-profile (user principal))
+    (map-get? user-profiles user)
+)
+
+;; ==================== MINTING FUNCTIONS ====================
+
+;; Mint new NFT
+(define-public (mint-nft 
+    (recipient principal)
+    (name (string-ascii 64))
+    (description (string-ascii 256))
+    (image-uri (string-ascii 256))
+    (royalty uint)
+)
+    (let (
+        (token-id (var-get next-token-id))
+    )
+        ;; Validate inputs
+        (asserts! (> (len name) u0) ERR-INVALID-PARAMETERS)
+        (asserts! (> (len image-uri) u0) ERR-INVALID-PARAMETERS)
+        (asserts! (is-valid-royalty royalty) ERR-INVALID-PARAMETERS)
+        
+        ;; Store NFT ownership
+        (map-set nft-owners token-id recipient)
+        
+        ;; Store NFT metadata
+        (map-set nft-metadata token-id {
+            name: name,
+            description: description,
+            image-uri: image-uri,
+            creator: tx-sender,
+            royalty: royalty
+        })
+        
+        ;; Update collection stats for creator
+        (map-set collection-stats tx-sender
+            (merge 
+                (default-to {total-minted: u0, total-sold: u0, total-volume: u0}
+                    (map-get? collection-stats tx-sender)
+                )
+                {total-minted: (+ (default-to u0 
+                    (get total-minted (map-get? collection-stats tx-sender))) u1)}
+            )
+        )
+        
+        ;; Increment token ID
+        (var-set next-token-id (+ token-id u1))
+        
+        ;; Print mint event
+        (print {
+            action: "mint",
+            token-id: token-id,
+            recipient: recipient,
+            creator: tx-sender
+        })
+        
+        (ok token-id)
+    )
+)
+
+;; Batch mint multiple NFTs
+(define-public (batch-mint 
+    (recipients (list 10 principal))
+    (names (list 10 (string-ascii 64)))
+    (descriptions (list 10 (string-ascii 256)))
+    (image-uris (list 10 (string-ascii 256)))
+    (royalty uint)
+)
+    (let (
+        (batch-size (len recipients))
+    )
+        ;; Validate all lists have same length
+        (asserts! (is-eq batch-size (len names)) ERR-INVALID-PARAMETERS)
+        (asserts! (is-eq batch-size (len descriptions)) ERR-INVALID-PARAMETERS)
+        (asserts! (is-eq batch-size (len image-uris)) ERR-INVALID-PARAMETERS)
+        (asserts! (> batch-size u0) ERR-INVALID-PARAMETERS)
+        (asserts! (is-valid-royalty royalty) ERR-INVALID-PARAMETERS)
+        
+        ;; Mint each NFT in the batch
+        (ok (map mint-single-in-batch 
+            recipients names descriptions image-uris
+        ))
+    )
+)
+
+;; Helper function for batch minting
+(define-private (mint-single-in-batch 
+    (recipient principal)
+    (name (string-ascii 64))
+    (description (string-ascii 256))
+    (image-uri (string-ascii 256))
+)
+    (let (
+        (token-id (var-get next-token-id))
+    )
+        ;; Store NFT data
+        (map-set nft-owners token-id recipient)
+        (map-set nft-metadata token-id {
+            name: name,
+            description: description,
+            image-uri: image-uri,
+            creator: tx-sender,
+            royalty: u0 ;; Default royalty for batch mint
+        })
+        
+        ;; Increment token ID
+        (var-set next-token-id (+ token-id u1))
+        token-id
+    )
+)
+
+;; ==================== TRANSFER FUNCTIONS ====================
+
+;; Transfer NFT
+(define-public (transfer (token-id uint) (sender principal) (recipient principal))
+    (let (
+        (current-owner (unwrap! (map-get? nft-owners token-id) ERR-NOT-FOUND))
+    )
+        ;; Validate transfer
+        (asserts! (is-eq current-owner sender) ERR-NOT-OWNER)
+        (asserts! (or (is-eq tx-sender sender) (is-eq tx-sender current-owner)) ERR-UNAUTHORIZED)
+        (asserts! (not (is-eq sender recipient)) ERR-INVALID-PARAMETERS)
+        
+        ;; Remove from any active listings
+        (map-delete listings token-id)
+        
+        ;; Update ownership
+        (map-set nft-owners token-id recipient)
+        
+        ;; Print transfer event
+        (print {
+            action: "transfer",
+            token-id: token-id,
+            sender: sender,
+            recipient: recipient
+        })
+        
+        (ok true)
+    )
+)
+
+;; Safe transfer (same as transfer for this implementation)
+(define-public (safe-transfer (token-id uint) (sender principal) (recipient principal))
+    (transfer token-id sender recipient)
+)
+
+;; ==================== APPROVAL FUNCTIONS ====================
+
+;; Set user profile
+(define-public (set-user-profile 
+    (username (string-ascii 32))
+    (bio (string-ascii 256))
+    (avatar-uri (string-ascii 256))
+)
+    (begin
+        (map-set user-profiles tx-sender {
+            username: username,
+            bio: bio,
+            avatar-uri: avatar-uri,
+            verified: false
+        })
+        
+        (print {
+            action: "profile-updated",
+            user: tx-sender,
+            username: username
+        })
+        
+        (ok true)
+    )
+)
+
+;; Verify user (admin only)
+(define-public (verify-user (user principal))
+    (begin
+        (asserts! (is-contract-owner) ERR-UNAUTHORIZED)
+        
+        (match (map-get? user-profiles user)
+            profile (begin
+                (map-set user-profiles user
+                    (merge profile {verified: true})
+                )
+                (ok true)
+            )
+            ERR-NOT-FOUND
+        )
+    )
+)
+
+;; Update metadata (creator only)
+(define-public (update-metadata 
+    (token-id uint)
+    (name (string-ascii 64))
+    (description (string-ascii 256))
+    (image-uri (string-ascii 256))
+)
+    (let (
+        (metadata (unwrap! (map-get? nft-metadata token-id) ERR-NOT-FOUND))
+        (creator (get creator metadata))
+    )
+        ;; Only creator can update metadata
+        (asserts! (is-eq tx-sender creator) ERR-UNAUTHORIZED)
+        (asserts! (> (len name) u0) ERR-INVALID-PARAMETERS)
+        (asserts! (> (len image-uri) u0) ERR-INVALID-PARAMETERS)
+        
+        ;; Update metadata while preserving creator and royalty
+        (map-set nft-metadata token-id
+            (merge metadata {
+                name: name,
+                description: description,
+                image-uri: image-uri
+            })
+        )
+        
+        (print {
+            action: "metadata-updated",
+            token-id: token-id,
+            creator: creator
+        })
+        
+        (ok true)
+    )
+)
