@@ -736,3 +736,357 @@
         (ok true)
     )
 )
+
+;; ==================== AUCTION FUNCTIONS ====================
+
+;; Start auction for NFT
+(define-public (start-auction 
+    (token-id uint) 
+    (min-bid uint) 
+    (duration uint)
+    (reserve-price uint)
+)
+    (let (
+        (owner (unwrap! (map-get? nft-owners token-id) ERR-NOT-FOUND))
+        (end-block (+ (get-current-block) duration))
+    )
+        ;; Validate auction
+        (asserts! (is-marketplace-enabled) ERR-UNAUTHORIZED)
+        (asserts! (is-eq tx-sender owner) ERR-NOT-OWNER)
+        (asserts! (> min-bid u0) ERR-INVALID-PRICE)
+        (asserts! (>= duration MIN-AUCTION-DURATION) ERR-INVALID-PARAMETERS)
+        (asserts! (<= duration MAX-AUCTION-DURATION) ERR-INVALID-PARAMETERS)
+        (asserts! (is-none (map-get? auctions token-id)) ERR-ALREADY-EXISTS)
+        (asserts! (is-none (map-get? listings token-id)) ERR-ALREADY-EXISTS)
+        
+        ;; Create auction
+        (map-set auctions token-id {
+            seller: owner,
+            min-bid: min-bid,
+            current-bid: u0,
+            current-bidder: none,
+            end-block: end-block,
+            reserve-met: (is-eq reserve-price u0)
+        })
+        
+        (print {
+            action: "auction-started",
+            token-id: token-id,
+            seller: owner,
+            min-bid: min-bid,
+            end-block: end-block,
+            reserve-price: reserve-price
+        })
+        
+        (ok true)
+    )
+)
+
+;; Place bid on auction
+(define-public (place-bid (token-id uint) (bid-amount uint))
+    (let (
+        (auction (unwrap! (map-get? auctions token-id) ERR-NOT-FOUND))
+        (seller (get seller auction))
+        (current-bid (get current-bid auction))
+        (current-bidder (get current-bidder auction))
+        (end-block (get end-block auction))
+        (min-bid (get min-bid auction))
+    )
+        ;; Validate bid
+        (asserts! (is-marketplace-enabled) ERR-UNAUTHORIZED)
+        (asserts! (not (is-eq tx-sender seller)) ERR-SELF-PURCHASE)
+        (asserts! (<= (get-current-block) end-block) ERR-AUCTION-ENDED)
+        (asserts! (>= (stx-get-balance tx-sender) bid-amount) ERR-INSUFFICIENT-FUNDS)
+        
+        ;; Check minimum bid requirements
+        (asserts! 
+            (if (is-eq current-bid u0)
+                (>= bid-amount min-bid)
+                (>= bid-amount (+ current-bid (/ current-bid u20))) ;; 5% increase
+            )
+            ERR-INVALID-PRICE
+        )
+        
+        ;; Refund previous bidder if exists
+        (match current-bidder
+            prev-bidder (try! (stx-transfer? current-bid (as-contract tx-sender) prev-bidder))
+            true
+        )
+        
+        ;; Hold the new bid amount
+        (try! (stx-transfer? bid-amount tx-sender (as-contract tx-sender)))
+        
+        ;; Update auction
+        (map-set auctions token-id
+            (merge auction {
+                current-bid: bid-amount,
+                current-bidder: (some tx-sender)
+            })
+        )
+        
+        (print {
+            action: "bid-placed",
+            token-id: token-id,
+            bidder: tx-sender,
+            bid-amount: bid-amount,
+            previous-bidder: current-bidder,
+            previous-bid: current-bid
+        })
+        
+        (ok true)
+    )
+)
+
+;; Finalize auction
+(define-public (finalize-auction (token-id uint))
+    (let (
+        (auction (unwrap! (map-get? auctions token-id) ERR-NOT-FOUND))
+        (seller (get seller auction))
+        (current-bid (get current-bid auction))
+        (current-bidder (get current-bidder auction))
+        (end-block (get end-block auction))
+        (reserve-met (get reserve-met auction))
+    )
+        ;; Validate finalization
+        (asserts! (> (get-current-block) end-block) ERR-AUCTION-ACTIVE)
+        
+        ;; Check if there was a winning bid
+        (match current-bidder
+            winner (begin
+                ;; Process sale with fees and royalties
+                (let (
+                    (metadata (unwrap! (map-get? nft-metadata token-id) ERR-NOT-FOUND))
+                    (creator (get creator metadata))
+                    (royalty-rate (get royalty metadata))
+                    (marketplace-fee (calculate-marketplace-fee current-bid))
+                    (royalty-amount (calculate-royalty current-bid royalty-rate))
+                    (seller-amount (- (- current-bid marketplace-fee) royalty-amount))
+                )
+                    ;; Transfer payments
+                    (try! (as-contract (stx-transfer? seller-amount tx-sender seller)))
+                    (try! (as-contract (stx-transfer? marketplace-fee tx-sender CONTRACT-OWNER)))
+                    
+                    ;; Pay royalties to creator (if different from seller)
+                    (if (and (> royalty-amount u0) (not (is-eq creator seller)))
+                        (try! (as-contract (stx-transfer? royalty-amount tx-sender creator)))
+                        true
+                    )
+                    
+                    ;; Transfer NFT to winner
+                    (map-set nft-owners token-id winner)
+                    
+                    ;; Update statistics
+                    (var-set total-marketplace-revenue 
+                        (+ (var-get total-marketplace-revenue) marketplace-fee)
+                    )
+                    (var-set total-creator-royalties 
+                        (+ (var-get total-creator-royalties) royalty-amount)
+                    )
+                )
+                
+                (print {
+                    action: "auction-finalized",
+                    token-id: token-id,
+                    winner: (some winner),
+                    final-bid: current-bid,
+                    seller: seller
+                })
+            )
+            ;; No bidders - return NFT to seller
+            (print {
+                action: "auction-ended-no-bids",
+                token-id: token-id,
+                winner: none,
+                final-bid: u0,
+                seller: seller
+            })
+        )
+        
+        ;; Remove auction
+        (map-delete auctions token-id)
+        (ok true)
+    )
+)
+
+;; Cancel auction (seller only, if no bids)
+(define-public (cancel-auction (token-id uint))
+    (let (
+        (auction (unwrap! (map-get? auctions token-id) ERR-NOT-FOUND))
+        (seller (get seller auction))
+        (current-bid (get current-bid auction))
+        (current-bidder (get current-bidder auction))
+    )
+        ;; Validate cancellation
+        (asserts! (is-eq tx-sender seller) ERR-NOT-OWNER)
+        (asserts! (is-eq current-bid u0) ERR-AUCTION-ACTIVE)
+        
+        ;; Remove auction
+        (map-delete auctions token-id)
+        
+        (print {
+            action: "auction-cancelled",
+            token-id: token-id,
+            seller: seller
+        })
+        
+        (ok true)
+    )
+)
+
+;; Get auction information
+(define-read-only (get-auction (token-id uint))
+    (map-get? auctions token-id)
+)
+
+;; Check if auction is active
+(define-read-only (is-auction-active (token-id uint))
+    (match (map-get? auctions token-id)
+        auction (<= (get-current-block) (get end-block auction))
+        false
+    )
+)
+
+;; ==================== COLLECTION MANAGEMENT ====================
+
+;; Get collection statistics
+(define-read-only (get-collection-stats (creator principal))
+    (map-get? collection-stats creator)
+)
+
+;; Get total supply
+(define-read-only (get-total-supply)
+    (- (var-get next-token-id) u1)
+)
+
+;; Get floor price for collection
+(define-read-only (get-floor-price)
+    ;; This is a simplified implementation - in a real contract,
+    ;; you'd iterate through all listings to find the minimum price
+    u0 ;; Placeholder - would need more complex logic
+)
+
+;; ==================== ADVANCED ANALYTICS ====================
+
+;; Get marketplace statistics
+(define-read-only (get-marketplace-stats)
+    {
+        total-supply: (get-total-supply),
+        total-revenue: (var-get total-marketplace-revenue),
+        total-royalties: (var-get total-creator-royalties),
+        marketplace-enabled: (var-get marketplace-enabled),
+        fee-rate: MARKETPLACE-FEE
+    }
+)
+
+;; Calculate potential earnings from sale
+(define-read-only (calculate-sale-breakdown (price uint) (royalty-rate uint))
+    (let (
+        (marketplace-fee (calculate-marketplace-fee price))
+        (royalty-amount (calculate-royalty price royalty-rate))
+        (seller-amount (- (- price marketplace-fee) royalty-amount))
+    )
+        {
+            sale-price: price,
+            marketplace-fee: marketplace-fee,
+            royalty-amount: royalty-amount,
+            seller-receives: seller-amount
+        }
+    )
+)
+
+;; ==================== BULK OPERATIONS ====================
+
+;; Bulk transfer NFTs
+(define-public (bulk-transfer 
+    (token-ids (list 50 uint))
+    (recipients (list 50 principal))
+)
+    (let (
+        (transfers-count (len token-ids))
+    )
+        ;; Validate inputs
+        (asserts! (is-eq transfers-count (len recipients)) ERR-INVALID-PARAMETERS)
+        (asserts! (> transfers-count u0) ERR-INVALID-PARAMETERS)
+        
+        ;; Execute transfers
+        (ok (map bulk-transfer-single token-ids recipients))
+    )
+)
+
+;; Helper for bulk transfer
+(define-private (bulk-transfer-single (token-id uint) (recipient principal))
+    (let (
+        (current-owner (unwrap! (map-get? nft-owners token-id) ERR-NOT-FOUND))
+    )
+        ;; Validate ownership
+        (asserts! (is-eq tx-sender current-owner) ERR-NOT-OWNER)
+        
+        ;; Remove from any active listings/auctions
+        (map-delete listings token-id)
+        (map-delete auctions token-id)
+        
+        ;; Transfer ownership
+        (map-set nft-owners token-id recipient)
+        (ok token-id)
+    )
+)
+
+;; ==================== SECURITY FEATURES ====================
+
+;; Pause contract (emergency only)
+(define-public (pause-contract)
+    (begin
+        (asserts! (is-contract-owner) ERR-UNAUTHORIZED)
+        (var-set marketplace-enabled false)
+        
+        (print {
+            action: "contract-paused",
+            admin: tx-sender
+        })
+        
+        (ok true)
+    )
+)
+
+;; Resume contract
+(define-public (resume-contract)
+    (begin
+        (asserts! (is-contract-owner) ERR-UNAUTHORIZED)
+        (var-set marketplace-enabled true)
+        
+        (print {
+            action: "contract-resumed", 
+            admin: tx-sender
+        })
+        
+        (ok true)
+    )
+)
+
+;; Get contract version info
+(define-read-only (get-contract-version)
+    {
+        name: "NFT Marketplace",
+        version: "1.0.0",
+        author: "Marketplace Team",
+        features: (list 
+            "nft-minting" 
+            "marketplace-trading" 
+            "auction-system" 
+            "royalty-support" 
+            "offer-system"
+            "user-profiles"
+            "bulk-operations"
+        )
+    }
+)
+
+;; Check contract health
+(define-read-only (get-contract-health)
+    {
+        marketplace-enabled: (var-get marketplace-enabled),
+        total-nfts: (get-total-supply),
+        contract-balance: (stx-get-balance (as-contract tx-sender)),
+        last-token-id: (- (var-get next-token-id) u1)
+    }
+)
